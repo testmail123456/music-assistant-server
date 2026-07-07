@@ -48,83 +48,9 @@ class GWClient:
         self.session = session
         self.formats = [{"cipher": "BF_CBC_STRIPE", "format": "MP3_128"}]
 
-    async def _update_user_data(self) -> None:
-        # retry=False: the retry path of _gw_api_call calls back into this
-        # method, which would otherwise recurse unboundedly on persistent
-        # API errors (maintenance, rate-limiting).
-        user_data = await self._gw_api_call("deezer.getUserData", False, retry=False)
-        if not user_data["results"]["USER"]["USER_ID"]:
-            msg = "Failed to authenticate with the GW API. Make sure you set a valid ARL."
-            raise DeezerGWError(msg)
-
-        if not user_data["results"]["OFFER_ID"]:
-            msg = "Free subscriptions cannot be used in MA. Make sure you set a valid ARL."
-            raise DeezerGWError(msg)
-
-        self._gw_csrf_token = user_data["results"]["checkForm"]
-        self._user_id = int(user_data["results"]["USER"]["USER_ID"])
-        self._license = user_data["results"]["USER"]["OPTIONS"]["license_token"]
-        self._license_expiration_timestamp = user_data["results"]["USER"]["OPTIONS"][
-            "expiration_timestamp"
-        ]
-        # Rebuild the format list from scratch so repeated refreshes stay idempotent
-        formats = [{"cipher": "BF_CBC_STRIPE", "format": "MP3_128"}]
-        web_qualities = user_data["results"]["USER"]["OPTIONS"]["web_sound_quality"]
-        mobile_qualities = user_data["results"]["USER"]["OPTIONS"]["mobile_sound_quality"]
-        if web_qualities["high"] or mobile_qualities["high"]:
-            formats.insert(0, {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"})
-        if web_qualities["lossless"] or mobile_qualities["lossless"]:
-            formats.insert(0, {"cipher": "BF_CBC_STRIPE", "format": "FLAC"})
-        self.formats = formats
-
-        self.user_country = user_data["results"]["COUNTRY"]
-
     async def setup(self) -> None:
         """Call this to let the client get its license and tokens."""
         await self._update_user_data()
-
-    async def _get_license(self) -> str | None:
-        if self._license_expiration_timestamp < future_timestamp(days=1):
-            await self._update_user_data()
-        return self._license
-
-    async def _gw_api_call(
-        self,
-        method: str,
-        use_csrf_token: bool = True,
-        args: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-        http_method: str = "POST",
-        retry: bool = True,
-    ) -> dict[str, Any]:
-        csrf_token = self._gw_csrf_token if use_csrf_token else "null"
-        if params is None:
-            params = {}
-        parameters = {"api_version": "1.0", "api_token": csrf_token, "input": "3", "method": method}
-        parameters |= params
-        # The ARL is passed per request instead of via the shared cookie jar:
-        # the session is shared server-wide, so a jar cookie would leak the
-        # ARL to other requests and break multiple Deezer instances.
-        result = await self.session.request(
-            http_method,
-            GW_LIGHT_URL,
-            params=cast("Mapping[str, str]", parameters),
-            timeout=ClientTimeout(total=30),
-            json=args,
-            headers={"User-Agent": USER_AGENT_HEADER},
-            cookies={"arl": self._arl_token},
-        )
-        result_json = await result.json()
-
-        if result_json["error"]:
-            if retry:
-                await self._update_user_data()
-                return await self._gw_api_call(
-                    method, use_csrf_token, args, params, http_method, False
-                )
-            msg = "Failed to call GW-API"
-            raise DeezerGWError(msg, result_json["error"])
-        return cast("dict[str, Any]", result_json)
 
     # Content support descriptor for page.get — tells the API which module types to return
     _PAGE_SUPPORT: ClassVar[dict[str, Any]] = {
@@ -266,3 +192,77 @@ class GWClient:
             args={"start": start, "nb": nb},
         )
         return cast("dict[str, Any]", result["results"])
+
+    async def _update_user_data(self) -> None:
+        # retry=False: the retry path of _gw_api_call calls back into this
+        # method, which would otherwise recurse unboundedly on persistent
+        # API errors (maintenance, rate-limiting).
+        user_data = await self._gw_api_call("deezer.getUserData", False, retry=False)
+        if not user_data["results"]["USER"]["USER_ID"]:
+            msg = "Failed to authenticate with the GW API. Make sure you set a valid ARL."
+            raise DeezerGWError(msg)
+
+        if not user_data["results"]["OFFER_ID"]:
+            msg = "Free subscriptions cannot be used in MA. Make sure you set a valid ARL."
+            raise DeezerGWError(msg)
+
+        self._gw_csrf_token = user_data["results"]["checkForm"]
+        self._user_id = int(user_data["results"]["USER"]["USER_ID"])
+        self._license = user_data["results"]["USER"]["OPTIONS"]["license_token"]
+        self._license_expiration_timestamp = user_data["results"]["USER"]["OPTIONS"][
+            "expiration_timestamp"
+        ]
+        # Rebuild the format list from scratch so repeated refreshes stay idempotent
+        formats = [{"cipher": "BF_CBC_STRIPE", "format": "MP3_128"}]
+        web_qualities = user_data["results"]["USER"]["OPTIONS"]["web_sound_quality"]
+        mobile_qualities = user_data["results"]["USER"]["OPTIONS"]["mobile_sound_quality"]
+        if web_qualities["high"] or mobile_qualities["high"]:
+            formats.insert(0, {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"})
+        if web_qualities["lossless"] or mobile_qualities["lossless"]:
+            formats.insert(0, {"cipher": "BF_CBC_STRIPE", "format": "FLAC"})
+        self.formats = formats
+
+        self.user_country = user_data["results"]["COUNTRY"]
+
+    async def _get_license(self) -> str | None:
+        if self._license_expiration_timestamp < future_timestamp(days=1):
+            await self._update_user_data()
+        return self._license
+
+    async def _gw_api_call(
+        self,
+        method: str,
+        use_csrf_token: bool = True,
+        args: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        http_method: str = "POST",
+        retry: bool = True,
+    ) -> dict[str, Any]:
+        csrf_token = self._gw_csrf_token if use_csrf_token else "null"
+        if params is None:
+            params = {}
+        parameters = {"api_version": "1.0", "api_token": csrf_token, "input": "3", "method": method}
+        parameters |= params
+        # The ARL is passed per request instead of via the shared cookie jar:
+        # the session is shared server-wide, so a jar cookie would leak the
+        # ARL to other requests and break multiple Deezer instances.
+        result = await self.session.request(
+            http_method,
+            GW_LIGHT_URL,
+            params=cast("Mapping[str, str]", parameters),
+            timeout=ClientTimeout(total=30),
+            json=args,
+            headers={"User-Agent": USER_AGENT_HEADER},
+            cookies={"arl": self._arl_token},
+        )
+        result_json = await result.json()
+
+        if result_json["error"]:
+            if retry:
+                await self._update_user_data()
+                return await self._gw_api_call(
+                    method, use_csrf_token, args, params, http_method, False
+                )
+            msg = "Failed to call GW-API"
+            raise DeezerGWError(msg, result_json["error"])
+        return cast("dict[str, Any]", result_json)

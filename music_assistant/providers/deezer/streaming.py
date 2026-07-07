@@ -104,6 +104,25 @@ class DeezerStreamingManager:
             return await self._get_audiobook_stream_details(item_id)
         return await self._get_track_stream_details(item_id)
 
+    # -- Audio stream (Blowfish decryption) --
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes]:
+        """Return the audio stream for the provider item."""
+        if streamdetails.media_type == MediaType.AUDIOBOOK and isinstance(streamdetails.data, dict):
+            async for chunk in self._stream_audiobook_chapters(streamdetails, seek_position):
+                yield chunk
+            return
+        async for chunk in self._stream_encrypted_track(streamdetails, seek_position):
+            yield chunk
+
+    async def on_streamed(self, streamdetails: StreamDetails) -> None:
+        """Handle callback when an item completed streaming."""
+        if not isinstance(streamdetails.data, dict) or "start_ts" not in streamdetails.data:
+            return
+        await self.provider.gw_client.log_listen(last_track=streamdetails)
+
     async def _get_track_stream_details(self, item_id: str) -> StreamDetails:
         """Return stream details for a regular Deezer track."""
         try:
@@ -228,19 +247,6 @@ class DeezerStreamingManager:
             allow_seek=True,
         )
 
-    # -- Audio stream (Blowfish decryption) --
-
-    async def get_audio_stream(
-        self, streamdetails: StreamDetails, seek_position: int = 0
-    ) -> AsyncGenerator[bytes]:
-        """Return the audio stream for the provider item."""
-        if streamdetails.media_type == MediaType.AUDIOBOOK and isinstance(streamdetails.data, dict):
-            async for chunk in self._stream_audiobook_chapters(streamdetails, seek_position):
-                yield chunk
-            return
-        async for chunk in self._stream_encrypted_track(streamdetails, seek_position):
-            yield chunk
-
     async def _stream_audiobook_chapters(
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes]:
@@ -353,12 +359,6 @@ class DeezerStreamingManager:
                     chunk_index += 1
                     del buffer[:2048]
         yield bytes(buffer)
-
-    async def on_streamed(self, streamdetails: StreamDetails) -> None:
-        """Handle callback when an item completed streaming."""
-        if not isinstance(streamdetails.data, dict) or "start_ts" not in streamdetails.data:
-            return
-        await self.provider.gw_client.log_listen(last_track=streamdetails)
 
     # -- Decryption helpers --
 

@@ -201,6 +201,156 @@ class DeezerBrowseManager:
         # Standard paths handled by base class
         return list(await base_browse(path))
 
+    # -- Recommendations --
+
+    @use_cache(3600)
+    async def recommendations(self) -> list[RecommendationFolder]:
+        """Get Deezer's recommendations including Flow and personalized content."""
+        result: list[RecommendationFolder] = []
+        recs = await self.provider.gql_client.get_recommendations(
+            playlists_first=50,
+            artist_playlists_first=50,
+            new_releases_first=10,
+            artists_first=0,
+            hot_tracks_limit=50,
+        )
+        await self._add_made_for_you(result)
+        self._add_recommended_playlists(result, recs)
+        self._add_recommended_artist_playlists(result, recs)
+        self._add_recommended_tracks(result, recs)
+        self._add_new_releases(result, recs)
+        await self._add_flow_configs(result)
+        recently_played = await self._get_recently_played_items()
+        if recently_played:
+            result.append(
+                RecommendationFolder(
+                    item_id="recently_played",
+                    provider=self.instance_id,
+                    name=BROWSE_RECENTLY_PLAYED,
+                    translation_key="recently_played",
+                    items=UniqueList(recently_played),
+                )
+            )
+        return result
+
+    # -- Virtual playlist metadata --
+
+    async def get_virtual_playlist(self, prov_playlist_id: str) -> Playlist | None:
+        """Return a virtual playlist, or None if the ID is not virtual."""
+        if prov_playlist_id == FLOW_PLAYLIST_ID:
+            cover = await self._get_flow_cover()
+            return create_virtual_playlist(self.provider, FLOW_PLAYLIST_ID, "Flow", image_url=cover)
+        if prov_playlist_id == RECOMMENDED_TRACKS_PLAYLIST_ID:
+            return create_virtual_playlist(
+                self.provider, RECOMMENDED_TRACKS_PLAYLIST_ID, "Hot Tracks"
+            )
+        if prov_playlist_id == TOP_CHARTS_PLAYLIST_ID:
+            return create_virtual_playlist(self.provider, TOP_CHARTS_PLAYLIST_ID, "Top Charts")
+        if prov_playlist_id == USER_TOP_TRACKS_PLAYLIST_ID:
+            return create_virtual_playlist(
+                self.provider, USER_TOP_TRACKS_PLAYLIST_ID, "Your Top Tracks"
+            )
+        if prov_playlist_id == PERSONAL_SONGS_PLAYLIST_ID:
+            return create_virtual_playlist(self.provider, PERSONAL_SONGS_PLAYLIST_ID, "My Uploads")
+        if prov_playlist_id.startswith(FLOW_CONFIG_PREFIX):
+            config_id = prov_playlist_id.removeprefix(FLOW_CONFIG_PREFIX)
+            flow_config = await self.provider.gql_client.get_flow_config_tracks(
+                flow_config_id=config_id
+            )
+            name = f"Flow: {flow_config.title}" if flow_config else f"Flow: {config_id}"
+            cover = get_flow_config_image(flow_config) if flow_config else None
+            return create_virtual_playlist(self.provider, prov_playlist_id, name, image_url=cover)
+        if prov_playlist_id.startswith(SMART_TRACKLIST_PREFIX):
+            tracklist_id = prov_playlist_id.removeprefix(SMART_TRACKLIST_PREFIX)
+            tracklist = await self.provider.gql_client.get_smart_tracklist(
+                smart_tracklist_id=tracklist_id, first=1
+            )
+            name = tracklist.title if tracklist else f"Mix {tracklist_id}"
+            cover = (
+                tracklist.cover.urls[0]
+                if tracklist and tracklist.cover and tracklist.cover.urls
+                else None
+            )
+            return create_virtual_playlist(
+                self.provider,
+                prov_playlist_id,
+                name,
+                image_url=cover,
+            )
+        if prov_playlist_id.startswith(SHAKER_CURATED_PREFIX):
+            group_id = prov_playlist_id.removeprefix(SHAKER_CURATED_PREFIX)
+            group = await self.provider.gql_client.get_music_together_group(
+                group_id=group_id,
+                mood=MusicTogetherSuggestedTracklistMoodInput.NONE,
+                tracks_first=1,
+            )
+            name = f"{group.name} - Playlist" if group else f"Shaker {group_id}"
+            cover_url: str | None = None
+            if (
+                group
+                and group.curated_tracklist
+                and group.curated_tracklist.picture
+                and group.curated_tracklist.picture.urls
+            ):
+                cover_url = group.curated_tracklist.picture.urls[0]
+            return create_virtual_playlist(
+                self.provider,
+                prov_playlist_id,
+                name,
+                image_url=cover_url,
+            )
+        if prov_playlist_id.startswith(SHAKER_PREFIX):
+            group_id = prov_playlist_id.removeprefix(SHAKER_PREFIX)
+            group = await self.provider.gql_client.get_music_together_group(
+                group_id=group_id,
+                mood=MusicTogetherSuggestedTracklistMoodInput.NONE,
+                tracks_first=1,
+            )
+            name = f"{group.name} - Mix" if group else f"Shaker {group_id}"
+            return create_virtual_playlist(
+                self.provider, prov_playlist_id, name, image_url=SHAKER_MIX_COVER
+            )
+        return None
+
+    # -- Virtual playlist track fetchers --
+
+    async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
+        """Get playlist tracks, routing virtual playlist IDs to their fetchers."""
+        if page > 0:
+            return []
+        if prov_playlist_id == FLOW_PLAYLIST_ID:
+            return await self._get_flow_tracks()
+        if prov_playlist_id == RECOMMENDED_TRACKS_PLAYLIST_ID:
+            return await self._get_recommended_tracks()
+        if prov_playlist_id == TOP_CHARTS_PLAYLIST_ID:
+            return await self._get_chart_tracks()
+        if prov_playlist_id == USER_TOP_TRACKS_PLAYLIST_ID:
+            return await self._get_user_chart_tracks()
+        if prov_playlist_id == PERSONAL_SONGS_PLAYLIST_ID:
+            return await self._get_personal_songs()
+        if prov_playlist_id.startswith(FLOW_CONFIG_PREFIX):
+            return await self._get_flow_config_tracks(
+                prov_playlist_id.removeprefix(FLOW_CONFIG_PREFIX)
+            )
+        if prov_playlist_id.startswith(SMART_TRACKLIST_PREFIX):
+            tracklist_id = prov_playlist_id.removeprefix(SMART_TRACKLIST_PREFIX)
+            return await self._get_smart_tracklist_tracks(tracklist_id)
+        if prov_playlist_id.startswith(SHAKER_CURATED_PREFIX):
+            group_id = prov_playlist_id.removeprefix(SHAKER_CURATED_PREFIX)
+            return await self._get_shaker_curated_tracks(group_id)
+        if prov_playlist_id.startswith(SHAKER_PREFIX):
+            shaker_id = prov_playlist_id.removeprefix(SHAKER_PREFIX)
+            return await self._get_shaker_tracks(shaker_id)
+        return await self._get_regular_playlist_tracks(prov_playlist_id)
+
+    async def invalidate_playlist_cache(self, prov_playlist_id: str) -> None:
+        """Invalidate the cached playlist tracks after a mutation."""
+        # Must mirror the @use_cache key derivation (func name + positional
+        # args, dot-joined) - breaks silently if _get_regular_playlist_tracks
+        # is renamed or ever called with a keyword argument.
+        cache_key = f"_get_regular_playlist_tracks.{prov_playlist_id}"
+        await self.mass.cache.delete(key=cache_key, provider=self.instance_id)
+
     # -- Made For You --
 
     async def _browse_made_for_you(
@@ -596,38 +746,6 @@ class DeezerBrowseManager:
                     items.append(parsed)
         return items
 
-    # -- Recommendations --
-
-    @use_cache(3600)
-    async def recommendations(self) -> list[RecommendationFolder]:
-        """Get Deezer's recommendations including Flow and personalized content."""
-        result: list[RecommendationFolder] = []
-        recs = await self.provider.gql_client.get_recommendations(
-            playlists_first=50,
-            artist_playlists_first=50,
-            new_releases_first=10,
-            artists_first=0,
-            hot_tracks_limit=50,
-        )
-        await self._add_made_for_you(result)
-        self._add_recommended_playlists(result, recs)
-        self._add_recommended_artist_playlists(result, recs)
-        self._add_recommended_tracks(result, recs)
-        self._add_new_releases(result, recs)
-        await self._add_flow_configs(result)
-        recently_played = await self._get_recently_played_items()
-        if recently_played:
-            result.append(
-                RecommendationFolder(
-                    item_id="recently_played",
-                    provider=self.instance_id,
-                    name=BROWSE_RECENTLY_PLAYED,
-                    translation_key="recently_played",
-                    items=UniqueList(recently_played),
-                )
-            )
-        return result
-
     async def _add_made_for_you(self, result: list[RecommendationFolder]) -> None:
         """Add Made For You section to recommendations."""
         made_for_me_items: list[Playlist] = []
@@ -778,116 +896,6 @@ class DeezerBrowseManager:
         if not result:
             return []
         return parse_recently_played_edges(self.provider, result.recently_played.edges)
-
-    # -- Virtual playlist metadata --
-
-    async def get_virtual_playlist(self, prov_playlist_id: str) -> Playlist | None:
-        """Return a virtual playlist, or None if the ID is not virtual."""
-        if prov_playlist_id == FLOW_PLAYLIST_ID:
-            cover = await self._get_flow_cover()
-            return create_virtual_playlist(self.provider, FLOW_PLAYLIST_ID, "Flow", image_url=cover)
-        if prov_playlist_id == RECOMMENDED_TRACKS_PLAYLIST_ID:
-            return create_virtual_playlist(
-                self.provider, RECOMMENDED_TRACKS_PLAYLIST_ID, "Hot Tracks"
-            )
-        if prov_playlist_id == TOP_CHARTS_PLAYLIST_ID:
-            return create_virtual_playlist(self.provider, TOP_CHARTS_PLAYLIST_ID, "Top Charts")
-        if prov_playlist_id == USER_TOP_TRACKS_PLAYLIST_ID:
-            return create_virtual_playlist(
-                self.provider, USER_TOP_TRACKS_PLAYLIST_ID, "Your Top Tracks"
-            )
-        if prov_playlist_id == PERSONAL_SONGS_PLAYLIST_ID:
-            return create_virtual_playlist(self.provider, PERSONAL_SONGS_PLAYLIST_ID, "My Uploads")
-        if prov_playlist_id.startswith(FLOW_CONFIG_PREFIX):
-            config_id = prov_playlist_id.removeprefix(FLOW_CONFIG_PREFIX)
-            flow_config = await self.provider.gql_client.get_flow_config_tracks(
-                flow_config_id=config_id
-            )
-            name = f"Flow: {flow_config.title}" if flow_config else f"Flow: {config_id}"
-            cover = get_flow_config_image(flow_config) if flow_config else None
-            return create_virtual_playlist(self.provider, prov_playlist_id, name, image_url=cover)
-        if prov_playlist_id.startswith(SMART_TRACKLIST_PREFIX):
-            tracklist_id = prov_playlist_id.removeprefix(SMART_TRACKLIST_PREFIX)
-            tracklist = await self.provider.gql_client.get_smart_tracklist(
-                smart_tracklist_id=tracklist_id, first=1
-            )
-            name = tracklist.title if tracklist else f"Mix {tracklist_id}"
-            cover = (
-                tracklist.cover.urls[0]
-                if tracklist and tracklist.cover and tracklist.cover.urls
-                else None
-            )
-            return create_virtual_playlist(
-                self.provider,
-                prov_playlist_id,
-                name,
-                image_url=cover,
-            )
-        if prov_playlist_id.startswith(SHAKER_CURATED_PREFIX):
-            group_id = prov_playlist_id.removeprefix(SHAKER_CURATED_PREFIX)
-            group = await self.provider.gql_client.get_music_together_group(
-                group_id=group_id,
-                mood=MusicTogetherSuggestedTracklistMoodInput.NONE,
-                tracks_first=1,
-            )
-            name = f"{group.name} - Playlist" if group else f"Shaker {group_id}"
-            cover_url: str | None = None
-            if (
-                group
-                and group.curated_tracklist
-                and group.curated_tracklist.picture
-                and group.curated_tracklist.picture.urls
-            ):
-                cover_url = group.curated_tracklist.picture.urls[0]
-            return create_virtual_playlist(
-                self.provider,
-                prov_playlist_id,
-                name,
-                image_url=cover_url,
-            )
-        if prov_playlist_id.startswith(SHAKER_PREFIX):
-            group_id = prov_playlist_id.removeprefix(SHAKER_PREFIX)
-            group = await self.provider.gql_client.get_music_together_group(
-                group_id=group_id,
-                mood=MusicTogetherSuggestedTracklistMoodInput.NONE,
-                tracks_first=1,
-            )
-            name = f"{group.name} - Mix" if group else f"Shaker {group_id}"
-            return create_virtual_playlist(
-                self.provider, prov_playlist_id, name, image_url=SHAKER_MIX_COVER
-            )
-        return None
-
-    # -- Virtual playlist track fetchers --
-
-    async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
-        """Get playlist tracks, routing virtual playlist IDs to their fetchers."""
-        if page > 0:
-            return []
-        if prov_playlist_id == FLOW_PLAYLIST_ID:
-            return await self._get_flow_tracks()
-        if prov_playlist_id == RECOMMENDED_TRACKS_PLAYLIST_ID:
-            return await self._get_recommended_tracks()
-        if prov_playlist_id == TOP_CHARTS_PLAYLIST_ID:
-            return await self._get_chart_tracks()
-        if prov_playlist_id == USER_TOP_TRACKS_PLAYLIST_ID:
-            return await self._get_user_chart_tracks()
-        if prov_playlist_id == PERSONAL_SONGS_PLAYLIST_ID:
-            return await self._get_personal_songs()
-        if prov_playlist_id.startswith(FLOW_CONFIG_PREFIX):
-            return await self._get_flow_config_tracks(
-                prov_playlist_id.removeprefix(FLOW_CONFIG_PREFIX)
-            )
-        if prov_playlist_id.startswith(SMART_TRACKLIST_PREFIX):
-            tracklist_id = prov_playlist_id.removeprefix(SMART_TRACKLIST_PREFIX)
-            return await self._get_smart_tracklist_tracks(tracklist_id)
-        if prov_playlist_id.startswith(SHAKER_CURATED_PREFIX):
-            group_id = prov_playlist_id.removeprefix(SHAKER_CURATED_PREFIX)
-            return await self._get_shaker_curated_tracks(group_id)
-        if prov_playlist_id.startswith(SHAKER_PREFIX):
-            shaker_id = prov_playlist_id.removeprefix(SHAKER_PREFIX)
-            return await self._get_shaker_tracks(shaker_id)
-        return await self._get_regular_playlist_tracks(prov_playlist_id)
 
     @use_cache(3600)
     async def _get_smart_tracklist_playlists(self) -> list[Playlist]:
@@ -1073,14 +1081,6 @@ class DeezerBrowseManager:
         return [
             parse_gw_track(self.provider, song, position=idx) for idx, song in enumerate(songs, 1)
         ]
-
-    async def invalidate_playlist_cache(self, prov_playlist_id: str) -> None:
-        """Invalidate the cached playlist tracks after a mutation."""
-        # Must mirror the @use_cache key derivation (func name + positional
-        # args, dot-joined) - breaks silently if _get_regular_playlist_tracks
-        # is renamed or ever called with a keyword argument.
-        cache_key = f"_get_regular_playlist_tracks.{prov_playlist_id}"
-        await self.mass.cache.delete(key=cache_key, provider=self.instance_id)
 
     @use_cache(3600 * 3)
     async def _get_regular_playlist_tracks(self, prov_playlist_id: str) -> list[Track]:

@@ -94,46 +94,6 @@ class DeezerMediaManager:
         self.logger = provider.logger
         self._audiobook_ids_in_favorites: set[str] | None = None
 
-    # -- Pagination helper --
-
-    async def _iter_paged(
-        self,
-        fetch: Callable[..., Awaitable[Any]],
-        extract: Callable[..., _Connection | None],
-    ) -> AsyncGenerator[Any]:
-        """Iterate a cursor-paginated connection, yielding edges with non-null nodes."""
-        cursor: str | None = None
-        while True:
-            result = await fetch(first=FAVORITES_PAGE_SIZE, after=cursor)
-            if result is None:
-                break
-            connection = extract(result)
-            if connection is None:
-                break
-            for edge in connection.edges:
-                if edge.node is not None:
-                    yield edge
-            if not connection.page_info.has_next_page:
-                break
-            cursor = connection.page_info.end_cursor
-
-    # -- Personal songs cache --
-
-    @use_cache(3600 * 24)
-    async def _get_personal_songs(self) -> list[dict[str, Any]]:
-        """Fetch all user-uploaded personal songs via the GW API (cached 24h)."""
-        all_songs: list[dict[str, Any]] = []
-        start = 0
-        page_size = 500
-        while True:
-            results = await self.provider.gw_client.get_personal_songs(start=start, nb=page_size)
-            data: list[dict[str, Any]] = results.get("data", [])
-            all_songs.extend(data)
-            if len(data) < page_size:
-                break
-            start += page_size
-        return all_songs
-
     # -- Library retrieval --
 
     async def get_library_artists(self) -> AsyncGenerator[Artist]:
@@ -155,29 +115,6 @@ class DeezerMediaManager:
                 if isinstance(artist, Artist) and artist.name not in seen_artist_names:
                     seen_artist_names.add(artist.name)
                     yield artist
-
-    async def _get_audiobook_ids_in_albums(self) -> set[str]:
-        """Identify which favorite album IDs are actually audiobooks."""
-        # Deezer stores audiobook favorites in the albums list, not in the
-        # dedicated (deprecated) audiobook favorites endpoint. We use
-        # check_audiobook_ids to tell them apart. Result is cached for the
-        # lifetime of this manager instance so both get_library_albums and
-        # get_library_audiobooks can share it without extra API calls.
-        if self._audiobook_ids_in_favorites is not None:
-            return self._audiobook_ids_in_favorites
-        album_ids: list[str] = []
-        async for edge in self._iter_paged(
-            self.provider.gql_client.get_favorite_albums,
-            lambda r: r.user_favorites.albums,
-        ):
-            album_ids.append(edge.node.id)
-        if not album_ids:
-            self._audiobook_ids_in_favorites = set()
-        else:
-            self._audiobook_ids_in_favorites = await self.provider.gql_client.check_audiobook_ids(
-                album_ids
-            )
-        return self._audiobook_ids_in_favorites
 
     async def get_library_albums(self) -> AsyncGenerator[Album]:
         """Retrieve all library albums from Deezer."""
@@ -600,78 +537,6 @@ class DeezerMediaManager:
                 ep.fully_played, ep.resume_position_ms = bookmarks[ep.item_id]
             yield ep
 
-    @use_cache(3600)
-    async def _fetch_podcast_episodes(self, prov_podcast_id: str) -> list[PodcastEpisode]:
-        """Fetch all episodes for a podcast (cached 1h)."""
-        # Two-layer caching strategy:
-        # - Outer (this decorator, 1h): avoids repeated cache lookups during
-        #   rapid navigation (e.g., user browsing back and forth between podcasts).
-        # - Inner (per-episode, 30 days): prevents re-fetching episode details
-        #   that rarely change. When the outer cache expires, only genuinely new
-        #   episodes require an API call.
-        result = await self.provider.gql_client.get_podcast(
-            podcast_id=prov_podcast_id, episodes_first=0
-        )
-        if result is None:
-            return []
-        podcast_mapping = ItemMapping(
-            media_type=MediaType.PODCAST,
-            item_id=result.id,
-            provider=self.instance_id,
-            name=result.display_title,
-        )
-        podcast_image_url: str | None = None
-        if result.cover and result.cover.urls:
-            podcast_image_url = result.cover.urls[0]
-        episode_ids = result.raw_episodes
-        if not episode_ids:
-            return []
-
-        cache = self.mass.cache
-        episode_cache_ttl = 3600 * 24 * 30  # 30 days
-
-        # Resolve cached vs uncached episode IDs
-        cached_episodes: dict[str, PodcastEpisode] = {}
-        uncached_ids: list[str] = []
-        for eid in episode_ids:
-            cache_key = f"podcast_episode.{eid}"
-            cached = await cache.get(cache_key, provider=self.instance_id)
-            if cached is not None:
-                cached_episodes[eid] = PodcastEpisode.from_dict(cached)
-            else:
-                uncached_ids.append(eid)
-
-        # Batch-fetch only uncached episodes
-        batch_size = 50
-        for i in range(0, len(uncached_ids), batch_size):
-            batch = uncached_ids[i : i + batch_size]
-            fetched = await self.provider.gql_client.get_podcast_episodes_by_ids(ids=batch)
-            for ep in fetched:
-                if ep is not None:
-                    parsed = parse_podcast_episode(
-                        self.provider, ep, podcast_mapping, 0, podcast_image_url
-                    )
-                    cached_episodes[ep.id] = parsed
-                    self.mass.create_task(
-                        cache.set(
-                            key=f"podcast_episode.{ep.id}",
-                            data=parsed.to_dict(),
-                            expiration=episode_cache_ttl,
-                            provider=self.instance_id,
-                        )
-                    )
-
-        # Build final list in original order with correct positions
-        episodes: list[PodcastEpisode] = []
-        position = 0
-        for eid in episode_ids:
-            if eid in cached_episodes:
-                position += 1
-                cached_ep = cached_episodes[eid]
-                cached_ep.position = position
-                episodes.append(cached_ep)
-        return episodes
-
     @use_cache(3600 * 24 * 7, allow_expired_cache=True)
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get albums by an artist."""
@@ -825,3 +690,138 @@ class DeezerMediaManager:
             msg = f"Created playlist {result.playlist.id} not found on Deezer"
             raise MediaNotFoundError(msg)
         return parse_playlist(self.provider, playlist, is_editable=True)
+
+    # -- Pagination helper --
+
+    async def _iter_paged(
+        self,
+        fetch: Callable[..., Awaitable[Any]],
+        extract: Callable[..., _Connection | None],
+    ) -> AsyncGenerator[Any]:
+        """Iterate a cursor-paginated connection, yielding edges with non-null nodes."""
+        cursor: str | None = None
+        while True:
+            result = await fetch(first=FAVORITES_PAGE_SIZE, after=cursor)
+            if result is None:
+                break
+            connection = extract(result)
+            if connection is None:
+                break
+            for edge in connection.edges:
+                if edge.node is not None:
+                    yield edge
+            if not connection.page_info.has_next_page:
+                break
+            cursor = connection.page_info.end_cursor
+
+    # -- Personal songs cache --
+
+    @use_cache(3600 * 24)
+    async def _get_personal_songs(self) -> list[dict[str, Any]]:
+        """Fetch all user-uploaded personal songs via the GW API (cached 24h)."""
+        all_songs: list[dict[str, Any]] = []
+        start = 0
+        page_size = 500
+        while True:
+            results = await self.provider.gw_client.get_personal_songs(start=start, nb=page_size)
+            data: list[dict[str, Any]] = results.get("data", [])
+            all_songs.extend(data)
+            if len(data) < page_size:
+                break
+            start += page_size
+        return all_songs
+
+    async def _get_audiobook_ids_in_albums(self) -> set[str]:
+        """Identify which favorite album IDs are actually audiobooks."""
+        # Deezer stores audiobook favorites in the albums list, not in the
+        # dedicated (deprecated) audiobook favorites endpoint. We use
+        # check_audiobook_ids to tell them apart. Result is cached for the
+        # lifetime of this manager instance so both get_library_albums and
+        # get_library_audiobooks can share it without extra API calls.
+        if self._audiobook_ids_in_favorites is not None:
+            return self._audiobook_ids_in_favorites
+        album_ids: list[str] = []
+        async for edge in self._iter_paged(
+            self.provider.gql_client.get_favorite_albums,
+            lambda r: r.user_favorites.albums,
+        ):
+            album_ids.append(edge.node.id)
+        if not album_ids:
+            self._audiobook_ids_in_favorites = set()
+        else:
+            self._audiobook_ids_in_favorites = await self.provider.gql_client.check_audiobook_ids(
+                album_ids
+            )
+        return self._audiobook_ids_in_favorites
+
+    @use_cache(3600)
+    async def _fetch_podcast_episodes(self, prov_podcast_id: str) -> list[PodcastEpisode]:
+        """Fetch all episodes for a podcast (cached 1h)."""
+        # Two-layer caching strategy:
+        # - Outer (this decorator, 1h): avoids repeated cache lookups during
+        #   rapid navigation (e.g., user browsing back and forth between podcasts).
+        # - Inner (per-episode, 30 days): prevents re-fetching episode details
+        #   that rarely change. When the outer cache expires, only genuinely new
+        #   episodes require an API call.
+        result = await self.provider.gql_client.get_podcast(
+            podcast_id=prov_podcast_id, episodes_first=0
+        )
+        if result is None:
+            return []
+        podcast_mapping = ItemMapping(
+            media_type=MediaType.PODCAST,
+            item_id=result.id,
+            provider=self.instance_id,
+            name=result.display_title,
+        )
+        podcast_image_url: str | None = None
+        if result.cover and result.cover.urls:
+            podcast_image_url = result.cover.urls[0]
+        episode_ids = result.raw_episodes
+        if not episode_ids:
+            return []
+
+        cache = self.mass.cache
+        episode_cache_ttl = 3600 * 24 * 30  # 30 days
+
+        # Resolve cached vs uncached episode IDs
+        cached_episodes: dict[str, PodcastEpisode] = {}
+        uncached_ids: list[str] = []
+        for eid in episode_ids:
+            cache_key = f"podcast_episode.{eid}"
+            cached = await cache.get(cache_key, provider=self.instance_id)
+            if cached is not None:
+                cached_episodes[eid] = PodcastEpisode.from_dict(cached)
+            else:
+                uncached_ids.append(eid)
+
+        # Batch-fetch only uncached episodes
+        batch_size = 50
+        for i in range(0, len(uncached_ids), batch_size):
+            batch = uncached_ids[i : i + batch_size]
+            fetched = await self.provider.gql_client.get_podcast_episodes_by_ids(ids=batch)
+            for ep in fetched:
+                if ep is not None:
+                    parsed = parse_podcast_episode(
+                        self.provider, ep, podcast_mapping, 0, podcast_image_url
+                    )
+                    cached_episodes[ep.id] = parsed
+                    self.mass.create_task(
+                        cache.set(
+                            key=f"podcast_episode.{ep.id}",
+                            data=parsed.to_dict(),
+                            expiration=episode_cache_ttl,
+                            provider=self.instance_id,
+                        )
+                    )
+
+        # Build final list in original order with correct positions
+        episodes: list[PodcastEpisode] = []
+        position = 0
+        for eid in episode_ids:
+            if eid in cached_episodes:
+                position += 1
+                cached_ep = cached_episodes[eid]
+                cached_ep.position = position
+                episodes.append(cached_ep)
+        return episodes
